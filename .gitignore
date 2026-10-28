@@ -1,0 +1,10 @@
+node_modules/
+app/dist/
+app/release/
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+*.mp4
+*.wav
+*.mp3

@@ -1,0 +1,37 @@
+{
+  "name": "vidigen",
+  "productName": "Vidigen",
+  "version": "0.1.0",
+  "description": "Local AI music videos for TikTok",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k -n vite,electron \"vite\" \"wait-on tcp:5173 && cross-env VIDIGEN_DEV_URL=http://localhost:5173 electron .\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "electron .",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "concurrently": "^10.0.0",
+    "cross-env": "^10.0.0",
+    "electron": "^45.0.0",
+    "electron-builder": "^26.0.0",
+    "typescript": "~5.9.3",
+    "vite": "^8.0.0",
+    "wait-on": "^9.0.0"
+  },
+  "build": {
+    "appId": "app.vidigen.desktop",
+    "productName": "Vidigen",
+    "files": ["dist/**", "electron/**"],
+    "extraResources": [{ "from": "../engine", "to": "engine", "filter": ["vidigen_engine/**", "pyproject.toml"] }],
+    "win": { "target": "nsis" }
+  }
+}
