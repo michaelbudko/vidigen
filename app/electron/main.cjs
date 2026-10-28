@@ -241,6 +241,11 @@ ipcMain.handle("dialog:open", async (_e, kind) => {
   return multi ? res.filePaths : res.filePaths[0];
 });
 
+ipcMain.handle("dialog:openFolder", async () => {
+  const res = await dialog.showOpenDialog(win, { properties: ["openDirectory"] });
+  return res.canceled ? null : res.filePaths[0];
+});
+
 ipcMain.handle("shell:reveal", (_e, p) => shell.showItemInFolder(p));
 
 ipcMain.handle("file:saveAs", async (_e, src) => {

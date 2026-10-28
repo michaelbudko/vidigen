@@ -195,3 +195,22 @@ def choose_window(a: Analysis, target: float, start: float | None = None) -> Win
 
         s = max(anchors, key=mean_energy)
     return Window(start=round(s, 3), end=round(min(a.duration, s + target), 3))
+
+
+def find_drop(a: Analysis, lookahead: int = 4, margin: float = 8.0) -> float:
+    """Time of the biggest jump in loudness (the drop in phonk/EDM), snapped to a
+    downbeat. Falls back to the loudest second when the track has no clear jump."""
+    e = np.asarray(a.energy, dtype=float)
+    if len(e) < 2 * lookahead + 2:
+        return 0.0
+    best_t, best_gain = None, -1.0
+    for t in range(lookahead, len(e) - lookahead):
+        if t < margin * 0.5 or t > a.duration - margin:
+            continue
+        gain = e[t : t + lookahead].mean() - e[t - lookahead : t].mean()
+        if gain > best_gain:
+            best_t, best_gain = t, gain
+    if best_t is None or best_gain < 0.08:
+        best_t = int(np.argmax(e))
+    anchors = a.downbeats or a.beats or [float(best_t)]
+    return float(min(anchors, key=lambda d: abs(d - best_t)))

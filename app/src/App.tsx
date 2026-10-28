@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Analysis, api, bridge, Character, EngineStatus, fmtTime, Job, mediaUrl, resetConnection, SongLicense, SystemInfo,
+  Analysis, api, bridge, Character, EngineStatus, fmtTime, Job, LibraryOverview, mediaUrl, resetConnection, SongLicense,
+  SystemInfo,
 } from "./api";
 import { avatarOf, Characters } from "./components/Characters";
+import { Edits } from "./components/Edits";
 import { EnergyTimeline } from "./components/EnergyTimeline";
 import { JobView } from "./components/JobView";
+import { Library } from "./components/Library";
 import { Welcome } from "./components/Welcome";
+
+type View = "edits" | "library" | "create" | "characters";
 
 const LICENSES: { value: SongLicense; label: string; credit: boolean }[] = [
   { value: "own_work", label: "My own music", credit: false },
@@ -24,8 +29,9 @@ export default function App() {
   const [sys, setSys] = useState<SystemInfo | null>(null);
   const [engineErr, setEngineErr] = useState("");
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
-  const [view, setView] = useState<"create" | "characters">("create");
+  const [view, setView] = useState<View>("edits");
   const [showSetup, setShowSetup] = useState(false);
+  const [overview, setOverview] = useState<LibraryOverview | null>(null);
 
   const [characters, setCharacters] = useState<Character[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
@@ -57,6 +63,7 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
 
   const loadCharacters = useCallback(() => api.characters().then(setCharacters).catch(() => {}), []);
+  const loadOverview = useCallback(() => api.library().then(setOverview).catch(() => {}), []);
 
   const connect = useCallback(() => {
     setEngineErr("");
@@ -70,9 +77,17 @@ export default function App() {
         setUseLlm(s.llm.available);
         api.jobs().then(setHistory).catch(() => {});
         loadCharacters();
+        loadOverview();
       })
       .catch((e) => setEngineErr(String(e.message ?? e)));
-  }, [loadCharacters]);
+  }, [loadCharacters, loadOverview]);
+
+  // The autopilot can add to the library at any time.
+  useEffect(() => {
+    if (!sys) return;
+    const t = setInterval(loadOverview, 30000);
+    return () => clearInterval(t);
+  }, [sys, loadOverview]);
 
   useEffect(() => {
     const off = bridge?.onEngineStatus(setEngineStatus);
@@ -129,7 +144,9 @@ export default function App() {
   const ready = !!sys && prompt.trim().length >= 3 && !analyzing;
   const presetInfo = sys?.presets.find((p) => p.name === preset);
   const presetReady = !!presetInfo && (presetInfo.download_gb === 0 || (presetInfo.downloaded && !!sys?.ml_runtime));
-  const welcome = !sys || !sys.setup.complete || showSetup;
+  // Phonk edits need no AI models, so the setup screen only gates the AI tabs.
+  const aiTab = view === "create" || view === "characters";
+  const welcome = !sys || showSetup || (!sys.setup.complete && aiTab);
   const maxLen = analysis ? Math.min(90, Math.floor(analysis.duration)) : 90;
 
   async function render() {
@@ -178,8 +195,15 @@ export default function App() {
           Vidigen
         </div>
         <nav className="tabs">
+          <button className={view === "edits" ? "on" : ""} onClick={() => setView("edits")}>
+            Edits
+          </button>
+          <button className={view === "library" ? "on" : ""} onClick={() => setView("library")}>
+            Library
+          </button>
+          <span className="tabs-sep" />
           <button className={view === "create" ? "on" : ""} onClick={() => setView("create")}>
-            Create
+            AI video
           </button>
           <button className={view === "characters" ? "on" : ""} onClick={() => setView("characters")}>
             Characters {characters.length > 0 && <span className="count">{characters.length}</span>}
@@ -190,12 +214,17 @@ export default function App() {
             <span className="pill bad">Engine offline</span>
           ) : sys ? (
             <>
+              {overview && (
+                <span className="pill">
+                  {overview.stats.tracks} tracks · {overview.stats.clips} clips
+                </span>
+              )}
               <span className={`pill ${gpu ? "good" : ""}`}>
                 {gpu ? `${gpu.name} · ${gpu.vram_gb} GB` : "No GPU detected"}
               </span>
-              <span className={`pill ${sys.llm.available ? "good" : ""}`}>
+              {aiTab && <span className={`pill ${sys.llm.available ? "good" : ""}`}>
                 {sys.llm.available ? `LLM · ${sys.llm.model}` : "LLM offline"}
-              </span>
+              </span>}
             </>
           ) : (
             <span className="pill">{engineStatus?.message ?? "Starting engine…"}</span>
@@ -223,6 +252,9 @@ export default function App() {
           }}
         />
       )}
+
+      {view === "edits" && sys && <Edits overview={overview} onOpenLibrary={() => setView("library")} />}
+      {view === "library" && sys && <Library overview={overview} onChange={loadOverview} />}
 
       {view === "characters" && sys && (
         <Characters
