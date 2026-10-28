@@ -58,7 +58,7 @@ export function Welcome({ sys, engineErr, engineStatus, onRetry, onDone, onClose
       <span className="logo big" />
       <div>
         <h1>Welcome to Vidigen</h1>
-        <p>Let's get your PC ready to make music videos. Everything runs locally.</p>
+        <p>Let's get your PC ready for AI videos. Everything runs locally. Phonk edits don't need any of this.</p>
       </div>
       {onClose && sys?.setup.complete && (
         <button className="ghost small close" onClick={onClose}>

@@ -151,6 +151,137 @@ export interface Task {
   error: string;
 }
 
+export interface LibTask extends Task {
+  kind: "refresh" | "import";
+  result: {
+    clips_added?: number;
+    tracks_added?: number;
+    errors?: string[];
+    stopped?: string;
+    found?: number;
+    added?: number;
+    skipped?: number;
+  } | null;
+}
+
+export interface KeyState {
+  set: boolean;
+  hint: string;
+}
+
+export type KeyName = "pexels" | "pixabay" | "jamendo";
+
+export interface LibraryOverview {
+  stats: { tracks: number; clips: number; per_category: Record<string, number>; disk_gb: number };
+  categories: Record<string, { label: string; queries: string[] }>;
+  looks: Record<string, string>;
+  intensity: Record<string, string>;
+  effects: string[];
+  keys: Record<KeyName, KeyState>;
+  key_links: Record<KeyName, string>;
+  busy: boolean;
+  root: string;
+}
+
+export interface TrackItem {
+  id: string;
+  source: string;
+  title: string;
+  artist: string;
+  license: string;
+  license_url: string;
+  page_url: string;
+  path: string;
+  duration: number;
+  tempo: number;
+  drop_at: number;
+  non_commercial: boolean;
+  used: number;
+  missing: boolean;
+}
+
+export interface ClipItem {
+  id: string;
+  source: string;
+  author: string;
+  page_url: string;
+  category: string;
+  duration: number;
+  width: number;
+  height: number;
+  motion_mean: number;
+  used: number;
+  missing: boolean;
+}
+
+export interface EditRequest {
+  track_id: string | null;
+  categories: string[];
+  duration: number;
+  intensity: "chill" | "hard" | "insane";
+  look: string;
+  effects: string[];
+  hook: string;
+  allow_nc: boolean;
+}
+
+export interface EditItem {
+  id: string;
+  status: "queued" | "running" | "done" | "failed" | "cancelled";
+  progress: number;
+  message: string;
+  error: string;
+  track: Partial<TrackItem> & { credit?: string };
+  theme: string[];
+  look: string;
+  window: { start?: number; end?: number };
+  drop: number;
+  shots: { start: number; duration: number; fx: string[]; speed: number }[];
+  caption: string;
+  credits: string[];
+  output: string;
+  thumbnail: string;
+  created: number;
+  day: string;
+  request: EditRequest & { auto: boolean };
+}
+
+export interface AutopilotConfig {
+  enabled: boolean;
+  per_day: number;
+  at: string;
+  duration: number;
+  intensity: string;
+  look: string;
+  categories: string[];
+  hooks: string[];
+  allow_nc: boolean;
+  refresh: boolean;
+  clips_per_day: number;
+  tracks_per_day: number;
+  max_footage_gb: number;
+  background: boolean;
+}
+
+export interface AutopilotState {
+  config: AutopilotConfig;
+  running: boolean;
+  message: string;
+  last_day: string;
+  last_result: {
+    day?: string;
+    edits?: string[];
+    failed?: number;
+    clips_added?: number;
+    tracks_added?: number;
+    errors?: string[];
+    finished?: number;
+  };
+  next_run: string | null;
+  background_supported: boolean;
+  error?: string;
+}
+
 export interface EngineStatus {
   phase: "starting" | "checking" | "installing" | "python-missing" | "ready" | "error";
   message: string;
@@ -165,6 +296,7 @@ interface Bridge {
   openExternal(url: string): Promise<void>;
   openFile(kind: "audio" | "video"): Promise<string | null>;
   openFile(kind: "images"): Promise<string[]>;
+  openFolder(): Promise<string | null>;
   reveal(path: string): Promise<void>;
   saveAs(path: string): Promise<string | null>;
   pathForFile(file: File): string;
@@ -249,6 +381,31 @@ export const api = {
   previews: (id: string, preset: string, count = 4, style?: string) =>
     call<Task>(`/characters/${id}/previews`, { method: "POST", body: JSON.stringify({ preset, count, style }) }),
   task: (id: string) => call<Task>(`/tasks/${id}`),
+  libTask: (id: string) => call<LibTask>(`/tasks/${id}`),
+  cancelTask: (id: string) => call<LibTask>(`/tasks/${id}/cancel`, { method: "POST" }),
+  library: () => call<LibraryOverview>("/library"),
+  tracks: () => call<TrackItem[]>("/library/tracks"),
+  clips: (category = "") => call<ClipItem[]>(`/library/clips?category=${encodeURIComponent(category)}`),
+  updateTrack: (id: string, patch: Partial<Pick<TrackItem, "title" | "artist" | "license" | "license_url">>) =>
+    call<TrackItem>(`/library/tracks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  removeMedia: (kind: "track" | "clip", id: string) => call<{ ok: boolean }>(`/library/${kind}/${id}`, { method: "DELETE" }),
+  refreshLibrary: (body: { clips: number; tracks: number; categories: string[]; max_footage_gb?: number }) =>
+    call<LibTask>("/library/refresh", { method: "POST", body: JSON.stringify(body) }),
+  importFolder: (body: { folder: string; kind: "music" | "footage"; license?: string; category?: string }) =>
+    call<LibTask>("/library/import", { method: "POST", body: JSON.stringify(body) }),
+  saveKeys: (keys: Partial<Record<KeyName, string>>) =>
+    call<Record<KeyName, KeyState>>("/keys", { method: "PUT", body: JSON.stringify(keys) }),
+  testKeys: () => call<Record<KeyName, { ok: boolean; error: string }>>("/keys/test", { method: "POST" }),
+  createEdit: (req: Partial<EditRequest>) => call<EditItem>("/edits", { method: "POST", body: JSON.stringify(req) }),
+  edits: () => call<EditItem[]>("/edits"),
+  edit: (id: string) => call<EditItem>(`/edits/${id}`),
+  cancelEdit: (id: string) => call<EditItem>(`/edits/${id}/cancel`, { method: "POST" }),
+  deleteEdit: (id: string) => call<{ ok: boolean }>(`/edits/${id}`, { method: "DELETE" }),
+  autopilot: () => call<AutopilotState>("/autopilot"),
+  saveAutopilot: (cfg: AutopilotConfig) =>
+    call<AutopilotState>("/autopilot", { method: "PUT", body: JSON.stringify(cfg) }),
+  runAutopilot: () => call<AutopilotState>("/autopilot/run", { method: "POST" }),
+  stopAutopilot: () => call<AutopilotState>("/autopilot/stop", { method: "POST" }),
   job: (id: string) => call<Job>(`/jobs/${id}`),
   cancel: (id: string) => call<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
   // Media elements cannot send headers, so fetch with the token and hand back a blob URL.
@@ -266,6 +423,14 @@ export function characterFile(id: string, path: string, bust = 0) {
   if (!live) return "";
   const q = new URLSearchParams({ path, t: live.token, v: String(bust) });
   return `${live.url}/characters/${id}/file?${q}`;
+}
+
+// Engine file URL with the token in the query, for <img>, <video> and <audio>.
+export function engineUrl(path: string, bust: string | number = "") {
+  if (!live) return "";
+  const q = new URLSearchParams({ t: live.token });
+  if (bust !== "") q.set("v", String(bust));
+  return `${live.url}${path}${path.includes("?") ? "&" : "?"}${q}`;
 }
 
 export function mediaUrl(path: string) {

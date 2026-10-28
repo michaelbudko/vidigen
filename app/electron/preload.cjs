@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld("vidigen", {
   installPython: () => ipcRenderer.invoke("setup:installPython"),
   openExternal: (url) => ipcRenderer.invoke("shell:open", url),
   openFile: (kind) => ipcRenderer.invoke("dialog:open", kind),
+  openFolder: () => ipcRenderer.invoke("dialog:openFolder"),
   reveal: (p) => ipcRenderer.invoke("shell:reveal", p),
   saveAs: (p) => ipcRenderer.invoke("file:saveAs", p),
   // Dropped File objects no longer expose .path; ask Electron for it.
