@@ -19,7 +19,8 @@ export interface Shot {
 }
 
 export interface RenderRequest {
-  song_path: string;
+  song_path: string | null;
+  bpm: number;
   prompt: string;
   style: string;
   duration: number;
@@ -33,7 +34,6 @@ export interface RenderRequest {
     title: string;
     artist: string;
     source_url: string;
-    attested: boolean;
   };
 }
 
@@ -73,6 +73,7 @@ export interface SystemInfo {
 
 interface Bridge {
   engine(): Promise<{ url: string; token: string }>;
+  onEngineStatus(cb: (msg: string) => void): () => void;
   openFile(kind: "audio" | "video"): Promise<string | null>;
   reveal(path: string): Promise<void>;
   saveAs(path: string): Promise<string | null>;
@@ -91,8 +92,12 @@ let conn: Promise<{ url: string; token: string }> | null = null;
 
 function connection() {
   if (!conn) {
-    if (bridge) conn = bridge.engine();
-    else {
+    if (bridge) {
+      conn = bridge.engine().catch((e: Error) => {
+        conn = null; // allow a retry
+        throw new Error(e.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ""));
+      });
+    } else {
       // Plain-browser mode for UI development: ?engine=http://127.0.0.1:PORT&token=...
       const q = new URLSearchParams(location.search);
       conn = Promise.resolve({ url: q.get("engine") ?? "", token: q.get("token") ?? "" });

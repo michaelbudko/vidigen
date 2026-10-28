@@ -22,13 +22,14 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--duration", type=float, default=45)
 
     r = sub.add_parser("render", help="render a video without the UI")
-    r.add_argument("song")
     r.add_argument("prompt")
+    r.add_argument("--song", help="audio file; without one the video is silent and cut to --bpm")
+    r.add_argument("--bpm", type=float, default=120)
     r.add_argument("--style", default="")
     r.add_argument("--duration", type=float, default=45)
     r.add_argument("--start", type=float)
     r.add_argument("--preset", default="mock", choices=list(PRESETS))
-    r.add_argument("--license", required=True,
+    r.add_argument("--license", default="own_work",
                    choices=["public_domain", "cc0", "cc_by", "cc_by_sa", "own_work", "licensed"])
     r.add_argument("--title", default="")
     r.add_argument("--artist", default="")
@@ -71,7 +72,8 @@ def main(argv: list[str] | None = None) -> int:
         start=args.start, preset=args.preset, use_llm=not args.no_llm, seed=args.seed,
         source_video=args.source_video,
         rights=SongRights(license=args.license, title=args.title, artist=args.artist,
-                          source_url=args.source_url, attested=True),
+                          source_url=args.source_url),
+        bpm=args.bpm,
     )
     job = pipeline.new_job(req, settings)
     last = ""

@@ -1,14 +1,13 @@
-"""Song rights attestation.
+"""Song licence info, used to credit the song in the caption and metadata.
 
-Vidigen cannot verify copyright on its own, so every render requires the user
-to state the song's licence. Licences that require credit must include it, and
-the credit is written into the video metadata and the suggested caption.
+Vidigen cannot verify copyright, and nothing here blocks a render. When the
+licence needs attribution (CC BY / BY-SA) the UI reminds the user to add it.
 """
 from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel
 
 
 class SongLicense(str, Enum):
@@ -33,19 +32,14 @@ NEEDS_CREDIT = {SongLicense.cc_by, SongLicense.cc_by_sa}
 
 
 class SongRights(BaseModel):
-    license: SongLicense
+    license: SongLicense = SongLicense.own_work
     title: str = ""
     artist: str = ""
     source_url: str = ""
-    attested: bool = False
 
-    @model_validator(mode="after")
-    def _check(self) -> "SongRights":
-        if not self.attested:
-            raise ValueError("confirm you have the right to use this song")
-        if self.license in NEEDS_CREDIT and not (self.title and self.artist):
-            raise ValueError(f"{LABELS[self.license]} requires the song title and artist for attribution")
-        return self
+    @property
+    def missing_credit(self) -> bool:
+        return self.license in NEEDS_CREDIT and not (self.title and self.artist)
 
     def credit_line(self) -> str:
         if not (self.title or self.artist):

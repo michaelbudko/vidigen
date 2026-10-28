@@ -18,10 +18,13 @@ from .licensing import SongRights
 
 
 class RenderRequest(BaseModel):
-    song_path: str
+    # Only the prompt is required. Without a song the cuts follow a beat grid at
+    # `bpm` and the video is exported silent, ready for a sound added in TikTok.
     prompt: str = Field(min_length=3)
+    song_path: Optional[str] = None
     style: str = ""
-    rights: SongRights
+    rights: SongRights = Field(default_factory=SongRights)
+    bpm: float = Field(default=120.0, ge=60, le=200)
     duration: float = Field(default=45.0, ge=MIN_DURATION, le=MAX_DURATION)
     start: Optional[float] = None  # seconds into the song; None picks the most energetic part
     preset: str = "mock"
@@ -89,7 +92,7 @@ def new_job(req: RenderRequest, settings: Settings) -> Job:
 
 
 def build_caption(req: RenderRequest) -> str:
-    credit = req.rights.credit_line()
+    credit = req.rights.credit_line() if req.song_path else ""
     tags = "#musicvideo #aiart #fyp"
     return "\n".join(p for p in [req.prompt.strip(), credit, tags] if p)
 
@@ -99,12 +102,17 @@ def run(job: Job, settings: Settings) -> Job:
     if req.preset not in PRESETS:
         raise ValueError(f"unknown preset {req.preset}")
     preset = PRESETS[req.preset]
-    song = Path(req.song_path)
+    song = Path(req.song_path) if req.song_path else None
     job.status = "running"
     try:
-        job.update("analyze", 0.02, "Finding the beat")
-        analysis = audio.analyze(song, settings)
-        window = audio.choose_window(analysis, req.duration, req.start)
+        if song:
+            job.update("analyze", 0.02, "Finding the beat")
+            analysis = audio.analyze(song, settings)
+            window = audio.choose_window(analysis, req.duration, req.start)
+        else:
+            job.update("analyze", 0.02, f"Using a {req.bpm:.0f} BPM beat grid")
+            analysis = audio.beat_grid(req.duration, req.bpm)
+            window = audio.Window(0.0, req.duration)
         job.window = {"start": window.start, "end": window.end, "tempo": analysis.tempo}
 
         job.update("plan", 0.06, "Planning shots")
@@ -139,12 +147,12 @@ def run(job: Job, settings: Settings) -> Job:
             job.update("assemble", 0.83 + 0.12 * i / n, f"Cutting shot {i + 1} of {n}")
             fitted.append(compose.fit_clip(settings, clip, s.duration, job.dir / "fit" / f"{i:03d}.mp4"))
 
-        job.update("mux", 0.96, "Adding the song")
+        job.update("mux", 0.96, "Adding the song" if song else "Finishing")
         silent = compose.concat(settings, fitted, job.dir / "video_only.mp4")
         job.caption = build_caption(req)
         out = compose.mux(
             settings, silent, song, window, job.dir / "vidigen.mp4",
-            metadata={"comment": req.rights.credit_line(), "description": req.prompt},
+            metadata={"comment": req.rights.credit_line() if song else "", "description": req.prompt},
         )
         job.output = str(out)
         job.thumbnail = str(compose.thumbnail(settings, out, min(1.0, window.duration / 2), job.dir / "thumb.jpg"))
@@ -152,6 +160,12 @@ def run(job: Job, settings: Settings) -> Job:
         job.status = "done"
     except Cancelled:
         job.status, job.message = "cancelled", "Cancelled"
+    except ModuleNotFoundError as e:
+        job.status = "failed"
+        job.error = (
+            f"The {req.preset} preset needs the AI packages ({e.name} is missing). "
+            "Run setup.ps1 to install them, or pick the mock preset."
+        )
     except Exception as e:  # surfaced to the UI
         job.status, job.error = "failed", str(e)
     finally:

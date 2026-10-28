@@ -78,13 +78,18 @@ def test_template_planner_offline(song, settings):
     assert all("neon fox" in s.prompt and "anime" in s.prompt for s in shots)
 
 
-def test_rights_require_attestation_and_credit():
+def test_rights_are_optional_and_credit_when_given():
+    assert SongRights().credit_line() == ""
+    assert SongRights(license="cc_by").missing_credit
+    r = SongRights(license="cc_by", title="Song", artist="Someone")
+    assert not r.missing_credit and "CC BY" in r.credit_line()
+
+
+def test_prompt_is_the_only_required_field():
     with pytest.raises(ValidationError):
-        SongRights(license="cc0", attested=False)
-    with pytest.raises(ValidationError):
-        SongRights(license="cc_by", attested=True)
-    r = SongRights(license="cc_by", title="Song", artist="Someone", attested=True)
-    assert "CC BY" in r.credit_line()
+        pipeline.RenderRequest()
+    req = pipeline.RenderRequest(prompt="a fox in the snow")
+    assert req.song_path is None and req.bpm == 120
 
 
 def test_preset_by_vram():
@@ -116,3 +121,19 @@ def test_mock_render_end_to_end(song, settings):
     assert any(s["codec_type"] == "audio" for s in info["streams"])
     assert abs(float(info["format"]["duration"]) - 30) < 0.6
     assert Path(job.thumbnail).is_file()
+
+
+def test_render_without_song_is_silent_and_beat_cut(settings):
+    settings.ollama_url = "http://127.0.0.1:9"
+    req = pipeline.RenderRequest(prompt="a lighthouse in fog", duration=30, bpm=100)
+    job = pipeline.run(pipeline.new_job(req, settings), settings)
+    assert job.status == "done", job.error
+    beat = 60 / 100
+    for s in job.shots[:-1]:
+        assert abs(s["end"] / beat - round(s["end"] / beat)) < 1e-3  # cuts land on the grid
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", job.output],
+        capture_output=True, text=True, check=True,
+    )
+    assert abs(float(probe.stdout) - 30) < 0.6
+    assert "Music:" not in job.caption

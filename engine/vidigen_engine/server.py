@@ -73,7 +73,7 @@ def analyze(req: AnalyzeRequest):
 
 @app.post("/jobs")
 def create_job(req: pipeline.RenderRequest):
-    if not Path(req.song_path).is_file():
+    if req.song_path and not Path(req.song_path).is_file():
         raise HTTPException(404, f"no such file: {req.song_path}")
     if req.source_video and not Path(req.source_video).is_file():
         raise HTTPException(404, f"no such file: {req.source_video}")
