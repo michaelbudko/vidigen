@@ -78,12 +78,30 @@ function run(cmd, args, label) {
 
 // Use engine/.venv from setup.ps1 if it is there; otherwise build a small venv in
 // the user's app data on first launch so the app runs with no manual setup.
+// Hash of the engine's dependency list; when it changes (after a git pull),
+// the venv is refreshed so new packages get installed.
+function engineDepsHash() {
+  const f = path.join(engineDir, "pyproject.toml");
+  return fs.existsSync(f) ? crypto.createHash("sha1").update(fs.readFileSync(f)).digest("hex") : "";
+}
+
+async function installEngine(py, why) {
+  sendStatus("installing", why);
+  const pkg = app.isPackaged ? [engineDir] : ["-e", engineDir];
+  await run(py, ["-m", "pip", "install", "--disable-pip-version-check", ...pkg], "Installing engine");
+  fs.writeFileSync(path.join(path.dirname(path.dirname(py)), ".vidigen-deps"), engineDepsHash());
+}
+
 async function ensurePython() {
   const ready = "import vidigen_engine, fastapi, uvicorn; print('ok')";
   const venvs = [path.join(engineDir, ".venv"), path.join(app.getPath("userData"), "engine-venv")];
   for (const v of venvs) {
     const py = venvPython(v);
-    if (fs.existsSync(py) && check(py, [], ready)) return py;
+    if (!fs.existsSync(py) || !check(py, [], ready)) continue;
+    const stamp = path.join(v, ".vidigen-deps");
+    const current = fs.existsSync(stamp) ? fs.readFileSync(stamp, "utf8").trim() : "";
+    if (current !== engineDepsHash()) await installEngine(py, "Updating the engine for this version");
+    return py;
   }
   sendStatus("checking", "Looking for Python");
   const base = findBasePython();
@@ -97,9 +115,7 @@ async function ensurePython() {
     sendStatus("installing", "First launch: creating the Python environment");
     await run(base[0], [...base[1], "-m", "venv", target], "Creating environment");
   }
-  sendStatus("installing", "First launch: installing the engine (about a minute)");
-  const pkg = app.isPackaged ? [engineDir] : ["-e", engineDir];
-  await run(py, ["-m", "pip", "install", "--disable-pip-version-check", ...pkg], "Installing engine");
+  await installEngine(py, "First launch: installing the engine (about a minute)");
   return py;
 }
 
