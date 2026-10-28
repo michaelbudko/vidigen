@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--artist", default="")
     r.add_argument("--source-url", default="")
     r.add_argument("--source-video", help="footage to restyle (video-to-video)")
+    r.add_argument("--character", action="append", default=[], help="character id to cast (repeatable)")
     r.add_argument("--no-llm", action="store_true")
     r.add_argument("--seed", type=int, default=42)
 
@@ -74,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         rights=SongRights(license=args.license, title=args.title, artist=args.artist,
                           source_url=args.source_url),
         bpm=args.bpm,
+        characters=args.character,
     )
     job = pipeline.new_job(req, settings)
     last = ""

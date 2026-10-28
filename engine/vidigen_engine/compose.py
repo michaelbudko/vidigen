@@ -17,7 +17,7 @@ def fit_clip(settings: Settings, src: Path, duration: float, out: Path) -> Path:
     Short generations (AI models top out around 5 s) are slowed down up to 2x,
     then the last frame is held for whatever is left.
     """
-    have = ffmpeg.probe_duration(settings.ffprobe, src)
+    have = ffmpeg.probe_duration(settings.ffmpeg, src)
     stretch = min(2.0, max(1.0, duration / have)) if have > 0 else 1.0
     vf = (
         f"setpts={stretch:.4f}*PTS,"

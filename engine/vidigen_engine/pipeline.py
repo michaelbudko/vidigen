@@ -12,9 +12,13 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from . import audio, compose, ffmpeg, planner
-from .backends import make_image_backend, make_video_backend
+from .backends import image_backend, make_video_backend
+from .characters import CharacterStore
 from .config import MIN_DURATION, MAX_DURATION, PRESETS, Settings
 from .licensing import SongRights
+
+# One GPU job at a time: renders and character previews share this.
+gpu_lock = threading.Lock()
 
 
 class RenderRequest(BaseModel):
@@ -32,6 +36,8 @@ class RenderRequest(BaseModel):
     seed: int = 42
     # Optional footage for video-to-video: each shot restyles the matching part of this clip.
     source_video: Optional[str] = None
+    # Character ids to cast; each shot features one of them.
+    characters: list[str] = Field(default_factory=list)
 
 
 class Cancelled(Exception):
@@ -97,7 +103,19 @@ def build_caption(req: RenderRequest) -> str:
     return "\n".join(p for p in [req.prompt.strip(), credit, tags] if p)
 
 
+def missing_models_message(preset: str, e: ModuleNotFoundError) -> str:
+    return (
+        f"The {preset} preset needs the AI models, which aren't installed yet ({e.name} is missing). "
+        "Open Setup to install them, or pick Test mode."
+    )
+
+
 def run(job: Job, settings: Settings) -> Job:
+    with gpu_lock:
+        return _run(job, settings)
+
+
+def _run(job: Job, settings: Settings) -> Job:
     req = job.request
     if req.preset not in PRESETS:
         raise ValueError(f"unknown preset {req.preset}")
@@ -115,25 +133,32 @@ def run(job: Job, settings: Settings) -> Job:
             window = audio.Window(0.0, req.duration)
         job.window = {"start": window.start, "end": window.end, "tempo": analysis.tempo}
 
+        store = CharacterStore(settings.characters_dir)
+        chars = {c.id: c for c in (store.get(cid) for cid in req.characters)}
+        cast = [planner.CastMember(c.id, c.name, c.appearance()) for c in chars.values()]
+
         job.update("plan", 0.06, "Planning shots")
         shots, job.planner = planner.plan(
-            analysis, window, req.prompt, req.style, settings, use_llm=req.use_llm, seed=req.seed
+            analysis, window, req.prompt, req.style, settings, use_llm=req.use_llm, seed=req.seed, cast=cast
         )
         job.shots = [s.to_dict() for s in shots]
         n = len(shots)
 
         raw: list[Path] = []
-        video = make_video_backend(
-            preset.video_backend, preset.video_model, preset.gen_width, preset.gen_height, settings.ffmpeg
-        )
+        video = make_video_backend(preset, settings.ffmpeg)
         if req.source_video:
             raw = _restyle_source(job, shots, video, settings)
         else:
-            images = make_image_backend(preset.image_backend, preset.image_model, preset.gen_width, preset.gen_height)
+            images = image_backend(preset)
+            refs = {cid: store.references(c) for cid, c in chars.items()}
             keyframes = []
             for i, s in enumerate(shots):
                 job.update("keyframes", 0.08 + 0.3 * i / n, f"Keyframe {i + 1} of {n}")
-                keyframes.append(images.generate(s.prompt, req.seed + i, job.dir / "keyframes" / f"{i:03d}.png"))
+                c = chars.get(s.character) if s.character else None
+                keyframes.append(images.generate(
+                    s.prompt, req.seed + i, job.dir / "keyframes" / f"{i:03d}.png",
+                    refs=refs.get(s.character) if c else None, likeness=c.likeness if c else 0.7,
+                ))
             images.unload()
             for i, (s, kf) in enumerate(zip(shots, keyframes)):
                 job.update("motion", 0.38 + 0.45 * i / n, f"Animating shot {i + 1} of {n}")
@@ -161,11 +186,9 @@ def run(job: Job, settings: Settings) -> Job:
     except Cancelled:
         job.status, job.message = "cancelled", "Cancelled"
     except ModuleNotFoundError as e:
-        job.status = "failed"
-        job.error = (
-            f"The {req.preset} preset needs the AI packages ({e.name} is missing). "
-            "Run setup.ps1 to install them, or pick the mock preset."
-        )
+        job.status, job.error = "failed", missing_models_message(req.preset, e)
+    except KeyError as e:
+        job.status, job.error = "failed", f"Character {e} no longer exists"
     except Exception as e:  # surfaced to the UI
         job.status, job.error = "failed", str(e)
     finally:
@@ -175,7 +198,7 @@ def run(job: Job, settings: Settings) -> Job:
 
 def _restyle_source(job: Job, shots: list[planner.Shot], video, settings: Settings) -> list[Path]:
     src = Path(job.request.source_video)
-    length = ffmpeg.probe_duration(settings.ffprobe, src)
+    length = ffmpeg.probe_duration(settings.ffmpeg, src)
     out = []
     n = len(shots)
     for i, s in enumerate(shots):

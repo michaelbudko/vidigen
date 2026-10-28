@@ -20,15 +20,16 @@ protocol.registerSchemesAsPrivileged([
   { scheme: "media", privileges: { stream: true, supportFetchAPI: true, bypassCSP: true } },
 ]);
 
-const PYTHON_HELP =
-  "Vidigen needs Python 3.10 or newer. Install it with `winget install Python.Python.3.12` " +
-  "(or from python.org, ticking \"Add python.exe to PATH\"), then restart Vidigen.";
+// The renderer's Welcome screen looks for this prefix to offer a one-click install.
+const PYTHON_MISSING = "[PYTHON_MISSING] Vidigen needs Python 3.10 or newer, and none was found on this PC.";
 
 const venvPython = (dir) =>
   isWin ? path.join(dir, "Scripts", "python.exe") : path.join(dir, "bin", "python");
 
-function sendStatus(message) {
-  if (win && !win.isDestroyed()) win.webContents.send("engine:status", message);
+let lastStatus = { phase: "starting", message: "Starting engine" };
+function sendStatus(phase, message) {
+  lastStatus = { phase, message };
+  if (win && !win.isDestroyed()) win.webContents.send("engine:status", lastStatus);
 }
 
 function check(cmd, args, code) {
@@ -37,11 +38,24 @@ function check(cmd, args, code) {
   return r.status === 0 && r.stdout.trim() === "ok";
 }
 
+function windowsPythonPaths() {
+  // A fresh install is not on this process's PATH yet, so look where installers put it.
+  const local = process.env.LOCALAPPDATA ?? "";
+  const roots = [path.join(local, "Programs", "Python"), "C:\\Program Files", "C:\\Program Files\\Python"];
+  const out = [[path.join(local, "Programs", "Python", "Launcher", "py.exe"), ["-3"]], ["C:\\Windows\\py.exe", ["-3"]]];
+  for (const v of ["313", "312", "311", "310"]) {
+    for (const r of roots) out.push([path.join(r, `Python${v}`, "python.exe"), []]);
+  }
+  return out.filter(([p]) => fs.existsSync(p));
+}
+
 function findBasePython() {
   const candidates = [];
   if (process.env.VIDIGEN_PYTHON) candidates.push([process.env.VIDIGEN_PYTHON, []]);
-  if (isWin) candidates.push(["py", ["-3.12"]], ["py", ["-3"]], ["python", []], ["python3", []]);
-  else candidates.push(["python3", []], ["python", []]);
+  if (isWin) {
+    candidates.push(["py", ["-3.12"]], ["py", ["-3"]], ["python", []], ["python3", []]);
+    candidates.push(...windowsPythonPaths());
+  } else candidates.push(["python3", []], ["python", []]);
   const recent = "import sys; print('ok' if sys.version_info >= (3, 10) else 'old')";
   return candidates.find(([cmd, args]) => check(cmd, args, recent)) ?? null;
 }
@@ -53,7 +67,7 @@ function run(cmd, args, label) {
     const onData = (d) => {
       tail = (tail + d.toString()).slice(-3000);
       const line = d.toString().trim().split(/\r?\n/).pop();
-      if (line) sendStatus(`${label}: ${line.slice(0, 120)}`);
+      if (line) sendStatus("installing", `${label}: ${line.slice(0, 120)}`);
     };
     p.stdout.on("data", onData);
     p.stderr.on("data", onData);
@@ -71,15 +85,19 @@ async function ensurePython() {
     const py = venvPython(v);
     if (fs.existsSync(py) && check(py, [], ready)) return py;
   }
+  sendStatus("checking", "Looking for Python");
   const base = findBasePython();
-  if (!base) throw new Error(PYTHON_HELP);
+  if (!base) {
+    sendStatus("python-missing", "Python not found");
+    throw new Error(PYTHON_MISSING);
+  }
   const target = venvs[1];
   const py = venvPython(target);
   if (!fs.existsSync(py)) {
-    sendStatus("First launch: creating the Python environment");
+    sendStatus("installing", "First launch: creating the Python environment");
     await run(base[0], [...base[1], "-m", "venv", target], "Creating environment");
   }
-  sendStatus("First launch: installing the engine (about a minute)");
+  sendStatus("installing", "First launch: installing the engine (about a minute)");
   const pkg = app.isPackaged ? [engineDir] : ["-e", engineDir];
   await run(py, ["-m", "pip", "install", "--disable-pip-version-check", ...pkg], "Installing engine");
   return py;
@@ -87,7 +105,7 @@ async function ensurePython() {
 
 async function startEngine() {
   const python = await ensurePython();
-  sendStatus("Starting engine");
+  sendStatus("starting", "Starting engine");
   const token = crypto.randomBytes(24).toString("base64url");
   engine = spawn(python, ["-m", "vidigen_engine", "serve"], {
     cwd: engineDir,
@@ -102,6 +120,7 @@ async function startEngine() {
       const m = buf.match(/VIDIGEN_READY port=(\d+)/);
       if (m && !engineInfo) {
         engineInfo = { url: `http://127.0.0.1:${m[1]}`, token };
+        sendStatus("ready", "Engine running");
         resolve(engineInfo);
       }
     });
@@ -112,7 +131,10 @@ async function startEngine() {
     engine.on("error", (e) => reject(new Error(`Could not start the Python engine: ${e.message}`)));
     engine.on("exit", (code) => {
       if (!engineInfo) reject(new Error(`Engine exited (${code}).\n${errTail}`));
+      else sendStatus("error", `Engine stopped (${code})`);
       engine = null;
+      engineInfo = null;
+      engineReady = null;
     });
   });
 }
@@ -150,14 +172,57 @@ function createWindow() {
 }
 
 ipcMain.handle("engine:info", () => getEngine());
+ipcMain.handle("engine:status", () => lastStatus);
+
+ipcMain.handle("engine:restart", () => {
+  if (engine) engine.kill();
+  engine = null;
+  engineInfo = null;
+  engineReady = null;
+  return getEngine();
+});
+
+// One-click Python for the Welcome screen. Falls back to the download page if winget is missing.
+ipcMain.handle("setup:installPython", async () => {
+  if (!isWin) {
+    shell.openExternal("https://www.python.org/downloads/");
+    return { ok: false, opened: true };
+  }
+  sendStatus("installing", "Installing Python 3.12 (this can take a few minutes)");
+  try {
+    await run(
+      "winget",
+      ["install", "-e", "--id", "Python.Python.3.12", "--scope", "user", "--silent",
+        "--accept-package-agreements", "--accept-source-agreements"],
+      "Installing Python",
+    );
+    return { ok: true };
+  } catch (e) {
+    if (!findBasePython()) {
+      shell.openExternal("https://www.python.org/downloads/windows/");
+      return { ok: false, opened: true, error: e.message };
+    }
+    return { ok: true };
+  }
+});
+
+ipcMain.handle("shell:open", (_e, url) => {
+  if (/^https:\/\//.test(url)) shell.openExternal(url);
+});
 
 ipcMain.handle("dialog:open", async (_e, kind) => {
   const filters = {
     audio: [{ name: "Audio", extensions: ["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"] }],
     video: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "webm", "avi"] }],
+    images: [{ name: "Photos", extensions: ["jpg", "jpeg", "png", "webp", "heic", "heif"] }],
   }[kind];
-  const res = await dialog.showOpenDialog(win, { properties: ["openFile"], filters });
-  return res.canceled ? null : res.filePaths[0];
+  const multi = kind === "images";
+  const res = await dialog.showOpenDialog(win, {
+    properties: multi ? ["openFile", "multiSelections"] : ["openFile"],
+    filters,
+  });
+  if (res.canceled) return multi ? [] : null;
+  return multi ? res.filePaths : res.filePaths[0];
 });
 
 ipcMain.handle("shell:reveal", (_e, p) => shell.showItemInFolder(p));

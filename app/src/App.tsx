@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Analysis, api, bridge, fmtTime, Job, mediaUrl, SongLicense, SystemInfo } from "./api";
+import {
+  Analysis, api, bridge, Character, EngineStatus, fmtTime, Job, mediaUrl, resetConnection, SongLicense, SystemInfo,
+} from "./api";
+import { avatarOf, Characters } from "./components/Characters";
 import { EnergyTimeline } from "./components/EnergyTimeline";
 import { JobView } from "./components/JobView";
+import { Welcome } from "./components/Welcome";
 
 const LICENSES: { value: SongLicense; label: string; credit: boolean }[] = [
   { value: "own_work", label: "My own music", credit: false },
@@ -19,7 +23,13 @@ const basename = (p: string) => p.split(/[\\/]/).pop() ?? p;
 export default function App() {
   const [sys, setSys] = useState<SystemInfo | null>(null);
   const [engineErr, setEngineErr] = useState("");
-  const [engineStatus, setEngineStatus] = useState("Starting engine…");
+  const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const [view, setView] = useState<"create" | "characters">("create");
+  const [showSetup, setShowSetup] = useState(false);
+
+  const [characters, setCharacters] = useState<Character[]>([]);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [cast, setCast] = useState<string[]>([]);
 
   const [prompt, setPrompt] = useState("");
   const [style, setStyle] = useState("Cinematic");
@@ -46,8 +56,12 @@ export default function App() {
   const [formErr, setFormErr] = useState("");
   const audioRef = useRef<HTMLAudioElement>(null);
 
+  const loadCharacters = useCallback(() => api.characters().then(setCharacters).catch(() => {}), []);
+
   const connect = useCallback(() => {
     setEngineErr("");
+    setSys(null);
+    resetConnection();
     api
       .system()
       .then((s) => {
@@ -55,15 +69,22 @@ export default function App() {
         setPreset(s.recommended_preset);
         setUseLlm(s.llm.available);
         api.jobs().then(setHistory).catch(() => {});
+        loadCharacters();
       })
       .catch((e) => setEngineErr(String(e.message ?? e)));
-  }, []);
+  }, [loadCharacters]);
 
   useEffect(() => {
     const off = bridge?.onEngineStatus(setEngineStatus);
+    bridge?.engineStatus().then(setEngineStatus);
     connect();
     return off;
   }, [connect]);
+
+  // Drop cast members that were deleted.
+  useEffect(() => {
+    setCast((c) => c.filter((id) => characters.some((ch) => ch.id === id)));
+  }, [characters]);
 
   const loadSong = useCallback(
     async (path: string) => {
@@ -106,6 +127,9 @@ export default function App() {
   const needsCredit = LICENSES.find((l) => l.value === license)!.credit && !(title && artist);
   const busy = job?.status === "running" || job?.status === "queued";
   const ready = !!sys && prompt.trim().length >= 3 && !analyzing;
+  const presetInfo = sys?.presets.find((p) => p.name === preset);
+  const presetReady = !!presetInfo && (presetInfo.download_gb === 0 || (presetInfo.downloaded && !!sys?.ml_runtime));
+  const welcome = !sys || !sys.setup.complete || showSetup;
   const maxLen = analysis ? Math.min(90, Math.floor(analysis.duration)) : 90;
 
   async function render() {
@@ -113,6 +137,7 @@ export default function App() {
     try {
       const j = await api.render({
         song_path: song,
+        characters: cast,
         bpm,
         prompt,
         style: style.toLowerCase(),
@@ -152,6 +177,14 @@ export default function App() {
           <span className="logo" />
           Vidigen
         </div>
+        <nav className="tabs">
+          <button className={view === "create" ? "on" : ""} onClick={() => setView("create")}>
+            Create
+          </button>
+          <button className={view === "characters" ? "on" : ""} onClick={() => setView("characters")}>
+            Characters {characters.length > 0 && <span className="count">{characters.length}</span>}
+          </button>
+        </nav>
         <div className="status">
           {engineErr ? (
             <span className="pill bad">Engine offline</span>
@@ -165,23 +198,46 @@ export default function App() {
               </span>
             </>
           ) : (
-            <span className="pill">{engineStatus}</span>
+            <span className="pill">{engineStatus?.message ?? "Starting engine…"}</span>
           )}
+          <button className="pill btn" onClick={() => setShowSetup(true)}>
+            Setup
+          </button>
         </div>
       </header>
 
-      <main className="layout">
-        <section className="panel form">
-          {engineErr && (
-            <div className="error engine-error">
-              <strong>The engine didn't start</strong>
-              <span>{engineErr}</span>
-              <button className="ghost small" onClick={connect}>
-                Retry
-              </button>
-            </div>
-          )}
+      {welcome && (
+        <Welcome
+          sys={sys}
+          engineErr={engineErr}
+          engineStatus={engineStatus}
+          onRetry={connect}
+          onClose={() => setShowSetup(false)}
+          onDone={(goTo) => {
+            setShowSetup(false);
+            connect();
+            if (goTo === "characters") {
+              setView("characters");
+              setEditing(null);
+            }
+          }}
+        />
+      )}
 
+      {view === "characters" && sys && (
+        <Characters
+          characters={characters}
+          selected={editing}
+          preset={presetReady ? preset : "mock"}
+          presetReady={presetReady}
+          onSelect={setEditing}
+          onChange={loadCharacters}
+          onOpenSetup={() => setShowSetup(true)}
+        />
+      )}
+
+      <main className="layout" hidden={view !== "create"}>
+        <section className="panel form">
           <div className="card">
             <h2>
               <b>1</b> Vision
@@ -193,6 +249,32 @@ export default function App() {
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
             />
+            <div className="cast">
+              <span className="cast-label">Cast</span>
+              {characters.map((c) => {
+                const on = cast.includes(c.id);
+                return (
+                  <button
+                    key={c.id}
+                    className={`cast-chip ${on ? "on" : ""}`}
+                    onClick={() => setCast(on ? cast.filter((id) => id !== c.id) : [...cast, c.id])}
+                    title={on ? "In this video" : "Add to this video"}
+                  >
+                    <img src={avatarOf(c)} alt="" />
+                    {c.name}
+                  </button>
+                );
+              })}
+              <button
+                className="cast-chip add"
+                onClick={() => {
+                  setView("characters");
+                  setEditing(null);
+                }}
+              >
+                {characters.length ? "+ New" : "+ Add yourself as a character"}
+              </button>
+            </div>
             <div className="chips">
               {STYLES.map((s) => (
                 <button key={s} className={`chip ${style === s ? "on" : ""}`} onClick={() => setStyle(style === s ? "" : s)}>
@@ -329,16 +411,25 @@ export default function App() {
                     onClick={() => setPreset(p.name)}
                     title={p.description}
                   >
-                    <strong>{p.name}</strong>
+                    <strong>{p.label}</strong>
                     <span>{p.min_vram_gb ? `${p.min_vram_gb}+ GB` : "any PC"}</span>
-                    {tooBig && p.min_vram_gb > 0 && <small>may not fit</small>}
+                    {p.download_gb > 0 && !p.downloaded ? (
+                      <small>not installed</small>
+                    ) : (
+                      tooBig && p.min_vram_gb > 0 && <small>may not fit</small>
+                    )}
                   </button>
                 );
               })}
             </div>
             <p className="hint">{sys?.presets.find((p) => p.name === preset)?.description}</p>
-            {sys && !sys.ml_runtime && (
-              <p className="hint warn">AI models aren't installed yet. Run setup.ps1 to use anything beyond the mock preset.</p>
+            {sys && !presetReady && (
+              <p className="hint warn">
+                {presetInfo?.label} isn't installed yet.{" "}
+                <button className="link" onClick={() => setShowSetup(true)}>
+                  Open Setup
+                </button>
+              </p>
             )}
             <div className="row">
               <label className="check">
