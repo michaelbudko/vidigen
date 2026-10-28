@@ -19,10 +19,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import audio, hardware, installer, pipeline
+from . import audio, autoedit, hardware, installer, pipeline, sources
+from .autopilot import Autopilot, AutopilotConfig
 from .backends import image_backend
 from .characters import STYLES, CharacterPatch, CharacterStore
 from .config import PRESETS, Settings
+from .library import CATEGORIES, Library
 
 settings = Settings()
 settings.llm_model = settings.load_state().get("llm_model", settings.llm_model)
@@ -31,8 +33,13 @@ TOKEN = os.environ.get("VIDIGEN_TOKEN") or secrets.token_urlsafe(24)
 
 jobs: dict[str, pipeline.Job] = {}
 work: "queue.Queue[pipeline.Job]" = queue.Queue()
-tasks: dict[str, dict] = {}  # character preview batches
+tasks: dict[str, dict] = {}  # character previews, library downloads and imports
 setup_task: Optional[installer.SetupTask] = None
+
+library = Library(settings)
+edits = autoedit.EditStore(settings)
+edit_work: "queue.Queue[autoedit.Edit]" = queue.Queue()
+library_lock = threading.Lock()  # one download or import at a time
 
 
 def _worker() -> None:
@@ -43,7 +50,24 @@ def _worker() -> None:
             pipeline.run(job, settings)
 
 
+def _edit_worker() -> None:
+    # Edits only need ffmpeg, so they run beside GPU renders, one at a time.
+    while True:
+        edit = edit_work.get()
+        if edit.status == "queued":
+            autoedit.build(edit, library)
+
+
+def submit_edit(req: autoedit.EditRequest) -> autoedit.Edit:
+    edit = edits.new(req)
+    edit_work.put(edit)
+    return edit
+
+
 threading.Thread(target=_worker, daemon=True).start()
+threading.Thread(target=_edit_worker, daemon=True).start()
+autopilot = Autopilot(settings, library, submit_edit, library_lock)
+autopilot.start()
 
 
 def auth(x_vidigen_token: str = Header(default=""), t: str = Query(default="")) -> None:
@@ -283,7 +307,259 @@ def make_previews(cid: str, req: PreviewRequest):
 def get_task(tid: str):
     if tid not in tasks:
         raise HTTPException(404, "no such task")
-    return tasks[tid]
+    return {k: v for k, v in tasks[tid].items() if not k.startswith("_")}
+
+
+@app.post("/tasks/{tid}/cancel")
+def cancel_task(tid: str):
+    task = tasks.get(tid)
+    if task is None:
+        raise HTTPException(404, "no such task")
+    if "_cancel" in task:
+        task["_cancel"].set()
+    return get_task(tid)
+
+
+def _library_task(kind: str, fn) -> dict:
+    """Run `fn(task)` in the background under the library lock and track it as a task."""
+    if library_lock.locked():
+        raise HTTPException(409, "The library is already updating. Wait for it to finish.")
+    tid = uuid.uuid4().hex[:10]
+    task = {"id": tid, "kind": kind, "status": "running", "message": "Starting", "progress": 0.0, "error": "",
+            "result": None, "created": time.time(), "_cancel": threading.Event()}
+    tasks[tid] = task
+
+    def go():
+        with library_lock:
+            try:
+                task["result"] = fn(task)
+                task["status"], task["progress"] = "done", 1.0
+            except Exception as e:
+                task["status"], task["error"] = "failed", str(e)
+
+    threading.Thread(target=go, daemon=True).start()
+    return get_task(tid)
+
+
+# ---- library ---------------------------------------------------------------------
+
+class RefreshRequest(BaseModel):
+    clips: int = Field(default=30, ge=0, le=500)
+    tracks: int = Field(default=10, ge=0, le=200)
+    categories: list[str] = Field(default_factory=list)
+    max_footage_gb: float = Field(default=40.0, ge=1, le=4000)
+
+
+class ImportRequest(BaseModel):
+    folder: str
+    kind: str = Field(pattern="^(music|footage)$")
+    license: str = ""
+    category: str = "racing"
+
+
+class TrackPatch(BaseModel):
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    license: Optional[str] = None
+    license_url: Optional[str] = None
+
+
+@app.get("/library")
+def library_overview():
+    keys = sources.load_keys(settings)
+    return {
+        "stats": library.stats(),
+        "categories": {k: {"label": v["label"], "queries": v["queries"]} for k, v in CATEGORIES.items()},
+        "looks": {k: v["label"] for k, v in autoedit.LOOKS.items()},
+        "intensity": {k: v["label"] for k, v in autoedit.INTENSITY.items()},
+        "effects": list(autoedit.EFFECTS),
+        "keys": sources.masked(keys),
+        "key_links": sources.KEY_LINKS,
+        "busy": library_lock.locked(),
+        "root": str(library.root),
+    }
+
+
+@app.get("/library/tracks")
+def library_tracks():
+    return [t.summary() for t in library.tracks()]
+
+
+@app.get("/library/clips")
+def library_clips(category: str = ""):
+    return [c.summary() for c in library.clips([category] if category else None)]
+
+
+@app.patch("/library/tracks/{tid}")
+def update_track(tid: str, patch: TrackPatch):
+    try:
+        return library.update_track(tid, **patch.model_dump()).summary()
+    except KeyError:
+        raise HTTPException(404, "no such track")
+
+
+@app.delete("/library/{kind}/{item_id}")
+def remove_media(kind: str, item_id: str):
+    if kind not in ("track", "clip"):
+        raise HTTPException(400, "kind is track or clip")
+    try:
+        library.remove(kind, item_id)
+    except KeyError:
+        raise HTTPException(404, f"no such {kind}")
+    return {"ok": True}
+
+
+@app.get("/library/{kind}/{item_id}/file")
+def media_file(kind: str, item_id: str, what: str = "media"):
+    try:
+        p = library.media_path(kind, item_id, what)
+    except KeyError:
+        raise HTTPException(404, f"no such {kind}")
+    if not p.is_file():
+        raise HTTPException(404, "file missing")
+    return FileResponse(p)
+
+
+@app.post("/library/refresh")
+def refresh_library(req: RefreshRequest):
+    def fn(task):
+        def progress(f, msg):
+            task["progress"], task["message"] = f, msg
+
+        return sources.refresh(library, clips=req.clips, tracks=req.tracks, categories=req.categories or None,
+                               max_footage_gb=req.max_footage_gb, progress=progress,
+                               cancel=task["_cancel"]).to_dict()
+
+    return _library_task("refresh", fn)
+
+
+@app.post("/library/import")
+def import_folder(req: ImportRequest):
+    folder = Path(req.folder)
+    if not folder.is_dir():
+        raise HTTPException(404, f"no such folder: {folder}")
+    if req.kind == "footage" and req.category not in CATEGORIES:
+        raise HTTPException(400, f"unknown category {req.category}")
+
+    def fn(task):
+        def progress(i, n, name):
+            task["progress"], task["message"] = i / max(1, n), f"{i + 1} of {n}: {name}"
+
+        return library.import_folder(folder, req.kind, license=req.license, category=req.category,
+                                     progress=progress)
+
+    return _library_task("import", fn)
+
+
+# ---- API keys --------------------------------------------------------------------------
+
+class KeysUpdate(BaseModel):
+    pexels: Optional[str] = None
+    pixabay: Optional[str] = None
+    jamendo: Optional[str] = None
+
+
+@app.get("/keys")
+def get_keys():
+    return sources.masked(sources.load_keys(settings))
+
+
+@app.put("/keys")
+def put_keys(req: KeysUpdate):
+    return sources.masked(sources.save_keys(settings, req.model_dump()))
+
+
+@app.post("/keys/test")
+def check_keys():
+    return sources.test_keys(settings)
+
+
+# ---- edits -------------------------------------------------------------------------------
+
+@app.post("/edits")
+def create_edit(req: autoedit.EditRequest):
+    if req.track_id:
+        try:
+            library.track(req.track_id)
+        except KeyError:
+            raise HTTPException(404, "no such track")
+    bad = [c for c in req.categories if c not in CATEGORIES]
+    if bad:
+        raise HTTPException(400, f"unknown category {bad[0]}")
+    return submit_edit(req).to_dict()
+
+
+@app.get("/edits")
+def list_edits():
+    return edits.list()
+
+
+@app.get("/edits/{eid}")
+def get_edit(eid: str):
+    try:
+        return edits.get(eid)
+    except KeyError:
+        raise HTTPException(404, "no such edit")
+
+
+@app.post("/edits/{eid}/cancel")
+def cancel_edit(eid: str):
+    e = edits.live.get(eid)
+    if e is None:
+        raise HTTPException(404, "no such running edit")
+    if e.status == "queued":
+        e.status = "cancelled"
+        e.save()
+    e.cancel()
+    return e.to_dict()
+
+
+@app.delete("/edits/{eid}")
+def delete_edit(eid: str):
+    try:
+        edits.delete(eid)
+    except KeyError:
+        raise HTTPException(404, "no such edit")
+    return {"ok": True}
+
+
+@app.get("/edits/{eid}/files/{kind}")
+def edit_file(eid: str, kind: str):
+    if kind not in ("video", "thumb"):
+        raise HTTPException(400, "kind is video or thumb")
+    try:
+        return FileResponse(edits.file(eid, kind))
+    except KeyError:
+        raise HTTPException(404, "not ready")
+
+
+# ---- autopilot ------------------------------------------------------------------------------
+
+@app.get("/autopilot")
+def get_autopilot():
+    return autopilot.to_dict()
+
+
+@app.put("/autopilot")
+def put_autopilot(cfg: AutopilotConfig):
+    bad = [c for c in cfg.categories if c not in CATEGORIES]
+    if bad:
+        raise HTTPException(400, f"unknown category {bad[0]}")
+    autopilot.set_config(cfg)
+    return autopilot.to_dict()
+
+
+@app.post("/autopilot/run")
+def run_autopilot():
+    if not autopilot.run_async():
+        raise HTTPException(409, "The autopilot is already running.")
+    return autopilot.to_dict()
+
+
+@app.post("/autopilot/stop")
+def stop_autopilot():
+    autopilot.stop()
+    return autopilot.to_dict()
 
 
 def serve(port: int = 0) -> None:

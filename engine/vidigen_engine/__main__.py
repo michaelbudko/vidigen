@@ -1,4 +1,5 @@
-"""Command line: `python -m vidigen_engine serve` for the app, `render` for scripting."""
+"""Command line: `python -m vidigen_engine serve` for the app; `edit`, `library` and
+`render` for scripting."""
 from __future__ import annotations
 
 import argparse
@@ -39,8 +40,68 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--no-llm", action="store_true")
     r.add_argument("--seed", type=int, default=42)
 
+    e = sub.add_parser("edit", help="make a phonk edit from the library")
+    e.add_argument("--duration", type=float, default=20)
+    e.add_argument("--intensity", default="hard", choices=["chill", "hard", "insane"])
+    e.add_argument("--look", default="auto")
+    e.add_argument("--category", action="append", default=[], help="footage theme (repeatable)")
+    e.add_argument("--track", help="track id; default is the least used")
+    e.add_argument("--hook", default="", help="text over the first seconds")
+    e.add_argument("--count", type=int, default=1)
+
+    lb = sub.add_parser("library", help="show, fill or import into the media library")
+    lsub = lb.add_subparsers(dest="action", required=True)
+    lsub.add_parser("stats")
+    rf = lsub.add_parser("refresh", help="download new footage and music (needs API keys)")
+    rf.add_argument("--clips", type=int, default=30)
+    rf.add_argument("--tracks", type=int, default=10)
+    rf.add_argument("--category", action="append", default=[])
+    im = lsub.add_parser("import", help="add a folder of music or footage")
+    im.add_argument("kind", choices=["music", "footage"])
+    im.add_argument("folder")
+    im.add_argument("--license", default="", help="licence of the music, such as cc-by or ncs")
+    im.add_argument("--category", default="racing")
+
     args = ap.parse_args(argv)
     settings = Settings()
+
+    if args.cmd == "library":
+        from pathlib import Path
+
+        from . import sources
+        from .library import Library
+
+        lib = Library(settings)
+        say = lambda f, m: print(f"[{f * 100:5.1f}%] {m}", file=sys.stderr)  # noqa: E731
+        if args.action == "refresh":
+            res = sources.refresh(lib, clips=args.clips, tracks=args.tracks, categories=args.category or None,
+                                  progress=say)
+            print(json.dumps(res.to_dict(), indent=2))
+        elif args.action == "import":
+            res = lib.import_folder(Path(args.folder), args.kind, license=args.license, category=args.category,
+                                    progress=lambda i, n, name: print(f"{i + 1}/{n} {name}", file=sys.stderr))
+            print(json.dumps(res, indent=2))
+        print(json.dumps(lib.stats(), indent=2))
+        return 0
+
+    if args.cmd == "edit":
+        from . import autoedit
+        from .library import Library
+
+        lib = Library(settings)
+        store = autoedit.EditStore(settings)
+        failed = 0
+        for _ in range(args.count):
+            req = autoedit.EditRequest(duration=args.duration, intensity=args.intensity, look=args.look,
+                                       categories=args.category, track_id=args.track, hook=args.hook)
+            ed = autoedit.build(store.new(req), lib)
+            if ed.status != "done":
+                print(f"{ed.status}: {ed.error}", file=sys.stderr)
+                failed += 1
+                continue
+            print(ed.output)
+            print(f"\n{ed.caption}\n", file=sys.stderr)
+        return 1 if failed else 0
 
     if args.cmd == "serve":
         from .server import serve
