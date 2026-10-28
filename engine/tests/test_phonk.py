@@ -375,3 +375,47 @@ def test_api_edits_and_library(tmp_path, monkeypatch, media):
     assert c.delete(f"/edits/{e['id']}").json() == {"ok": True}
     assert c.delete(f"/library/track/{tracks[0]['id']}").json() == {"ok": True}
     assert (music / "song.wav").is_file()
+
+
+def test_background_schedule_and_lock(lib):
+    import threading
+    import xml.etree.ElementTree as ET
+
+    from vidigen_engine import autopilot as ap_mod
+
+    xml = ap_mod.task_xml("09:30", r"C:\Users\me\venv\Scripts\pythonw.exe", r"C:\a&b\engine", today="2026-11-02")
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    root = ET.fromstring(xml.split("?>", 1)[1])
+    assert root.find(".//t:StartBoundary", ns).text == "2026-11-02T09:30:00"
+    assert root.find(".//t:StartWhenAvailable", ns).text == "true"
+    assert root.find(".//t:WorkingDirectory", ns).text == r"C:\a&b\engine"
+    assert root.find(".//t:Arguments", ns).text == "-m vidigen_engine autopilot"
+
+    calls = []
+
+    def fake_schedule(at):
+        calls.append(at)
+        return ""
+
+    pilot = Autopilot(lib.settings, lib, lambda req: None, threading.Lock())
+    cfg = AutopilotConfig(enabled=True, background=True, at="08:15")
+    assert pilot.set_config(cfg, schedule=fake_schedule) == ""
+    assert calls == ["08:15"]
+    # Switched on after 08:15: today counts as done, the first batch is tomorrow.
+    now = datetime.now()
+    late = (now.hour, now.minute) >= (8, 15)
+    assert (pilot.last_day == now.strftime("%Y-%m-%d")) == late
+    pilot.set_config(cfg.model_copy(update={"per_day": 5}), schedule=fake_schedule)
+    assert calls == ["08:15"]  # same time: nothing to re-register
+    pilot.set_config(cfg.model_copy(update={"background": False}), schedule=fake_schedule)
+    assert calls == ["08:15", None]
+    failed = pilot.set_config(cfg, schedule=lambda at: "Access is denied.")
+    assert failed == "Access is denied." and pilot.config.background is False
+
+    # A run in another process holds the lock: this one stands back.
+    other = Autopilot(lib.settings, lib, lambda req: None, threading.Lock())
+    assert other._acquire()
+    assert pilot.to_dict()["running"] is True
+    assert pilot.run() == {} and pilot.last_result == {}
+    other._lock.unlink()
+    assert pilot.to_dict()["running"] is False

@@ -80,6 +80,11 @@ class Track:
         return audio.Analysis(self.duration, self.tempo, self.beats, self.downbeats, self.energy)
 
     @property
+    def bpm(self) -> float:
+        """Tempo as people would count it: the tracker often hears phonk at half time."""
+        return round(self.tempo * 2, 1) if self.tempo < 90 else self.tempo
+
+    @property
     def non_commercial(self) -> bool:
         return "nc" in self.license.lower().split("-") or "nc" in self.license_url.lower()
 
@@ -92,7 +97,7 @@ class Track:
         return {
             "id": self.id, "source": self.source, "title": self.title, "artist": self.artist,
             "license": self.license, "license_url": self.license_url, "page_url": self.page_url,
-            "path": self.path, "duration": self.duration, "tempo": self.tempo, "drop_at": self.drop_at,
+            "path": self.path, "duration": self.duration, "tempo": self.bpm, "drop_at": self.drop_at,
             "non_commercial": self.non_commercial, "used": self.used, "missing": not Path(self.path).is_file(),
         }
 

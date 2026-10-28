@@ -545,8 +545,8 @@ def put_autopilot(cfg: AutopilotConfig):
     bad = [c for c in cfg.categories if c not in CATEGORIES]
     if bad:
         raise HTTPException(400, f"unknown category {bad[0]}")
-    autopilot.set_config(cfg)
-    return autopilot.to_dict()
+    error = autopilot.set_config(cfg)
+    return {**autopilot.to_dict(), "error": error}
 
 
 @app.post("/autopilot/run")

@@ -62,8 +62,27 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--license", default="", help="licence of the music, such as cc-by or ncs")
     im.add_argument("--category", default="racing")
 
+    au = sub.add_parser("autopilot", help="make today's edits if they are due (Task Scheduler runs this)")
+    au.add_argument("--force", action="store_true", help="run now even if today's edits exist")
+
     args = ap.parse_args(argv)
     settings = Settings()
+
+    if args.cmd == "autopilot":
+        import threading
+
+        from . import autoedit
+        from .autopilot import Autopilot
+        from .library import Library
+
+        lib = Library(settings)
+        store = autoedit.EditStore(settings)
+        pilot = Autopilot(settings, lib, lambda req: autoedit.build(store.new(req), lib), threading.Lock())
+        if not (args.force or (pilot.config.enabled and pilot.due())):
+            print("Nothing to do: the autopilot is off or today's edits are done.", file=sys.stderr)
+            return 0
+        print(json.dumps(pilot.run(scheduled=not args.force), indent=2))
+        return 0
 
     if args.cmd == "library":
         from pathlib import Path

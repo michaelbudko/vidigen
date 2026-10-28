@@ -26,7 +26,7 @@ from .audio import Window
 from .config import OUT_FPS, OUT_HEIGHT, OUT_WIDTH, Settings
 from .library import CATEGORIES, MOTION_STEP, Clip, Library, Track
 
-ENCODE = ["-c:v", "libx264", "-preset", "fast", "-crf", "19", "-pix_fmt", "yuv420p", "-r", str(OUT_FPS)]
+ENCODE = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-r", str(OUT_FPS)]
 EFFECTS = ("flash", "punch", "shake", "rgb", "slowmo")
 LOOKS: dict[str, dict] = {
     "dark": {"label": "Dark", "vf": "eq=contrast=1.18:saturation=0.8:brightness=-0.04,vignette=PI/4.5"},
