@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass, asdict
+from typing import Optional
 
 import httpx
 
@@ -51,6 +52,7 @@ class Shot:
     prompt: str
     motion: str
     intensity: float  # 0..1 from the song's energy, drives motion speed
+    character: Optional[str] = None  # id of the cast member in this shot
 
     @property
     def duration(self) -> float:
@@ -89,18 +91,33 @@ def cut_points(a: Analysis, w: Window) -> list[float]:
     return cuts
 
 
-def _template_prompts(user_prompt: str, style: str, n: int, seed: int) -> list[tuple[str, str]]:
+@dataclass
+class CastMember:
+    id: str
+    name: str
+    appearance: str
+
+
+# Framings that keep a face large enough for the likeness to carry.
+CAST_FRAMINGS = ["medium shot", "close-up", "low angle shot", "medium close-up", "three-quarter view", "tracking shot"]
+
+PlannedShot = tuple[str, str, Optional[str]]  # prompt, motion, character id
+
+
+def _template_prompts(user_prompt: str, style: str, n: int, seed: int, cast: list[CastMember]) -> list[PlannedShot]:
     rng = random.Random(seed)
     out = []
     for i in range(n):
-        framing = FRAMINGS[(i + rng.randrange(3)) % len(FRAMINGS)]
+        member = cast[i % len(cast)] if cast else None
+        pool = CAST_FRAMINGS if member else FRAMINGS
+        framing = pool[(i + rng.randrange(3)) % len(pool)]
         light = rng.choice(LIGHTING)
         motion = rng.choice(MOTIONS)
-        parts = [user_prompt.strip(), framing, light]
+        parts = [member.appearance if member else "", user_prompt.strip(), framing, light]
         if style:
             parts.append(style.strip())
         parts.append("cinematic, vertical composition, highly detailed")
-        out.append((", ".join(p for p in parts if p), motion))
+        out.append((", ".join(p for p in parts if p), motion, member.id if member else None))
     return out
 
 
@@ -108,14 +125,20 @@ LLM_INSTRUCTIONS = """You are a music video director. Write a shot list for a ve
 Concept: {prompt}
 Visual style: {style}
 Song tempo: {tempo:.0f} BPM. There are exactly {n} shots. Shot energies (0=calm, 1=intense): {energies}
-Keep the same main subject and world across shots so the video feels continuous, but vary framing,
+{cast}Keep the same main subject and world across shots so the video feels continuous, but vary framing,
 lighting and action. Match intensity to energy. Each prompt is one image-generation prompt under 60 words.
-Respond with JSON only: {{"shots": [{{"prompt": "...", "motion": one of {motions}}}, ...]}}"""
+Respond with JSON only: {{"shots": [{{"prompt": "...", "motion": one of {motions}, "character": name or null}}, ...]}}"""
+
+CAST_INSTRUCTIONS = """Cast (feature them in most shots, framed medium or closer so faces are clear; describe them by
+appearance in the prompt, never by name, and put their name in "character"):
+{members}
+"""
 
 
 def _llm_prompts(
-    settings: Settings, user_prompt: str, style: str, tempo: float, energies: list[float]
-) -> list[tuple[str, str]] | None:
+    settings: Settings, user_prompt: str, style: str, tempo: float, energies: list[float], cast: list[CastMember]
+) -> list[PlannedShot] | None:
+    members = "\n".join(f"- {m.name}: {m.appearance}" for m in cast)
     body = {
         "model": settings.llm_model,
         "prompt": LLM_INSTRUCTIONS.format(
@@ -125,9 +148,12 @@ def _llm_prompts(
             n=len(energies),
             energies=[round(e, 2) for e in energies],
             motions=MOTIONS,
+            cast=CAST_INSTRUCTIONS.format(members=members) if cast else "",
         ),
         "format": "json",
         "stream": False,
+        # Unload right away so the LLM does not hold VRAM the image model needs.
+        "keep_alive": 0,
         "options": {"temperature": 0.8},
     }
     try:
@@ -136,13 +162,18 @@ def _llm_prompts(
         shots = json.loads(r.json()["response"])["shots"]
     except Exception:
         return None
+    by_name = {m.name.lower(): m for m in cast}
     out = []
     for s in shots[: len(energies)]:
         motion = s.get("motion") if s.get("motion") in MOTIONS else "push_in"
         prompt = str(s.get("prompt", "")).strip()
         if not prompt:
             return None
-        out.append((f"{prompt}, {style}".strip(", ") if style else prompt, motion))
+        member = by_name.get(str(s.get("character") or "").lower())
+        if member:
+            # The adapter carries the face; the description keeps hair, build and age consistent.
+            prompt = f"{member.appearance}, {prompt}"
+        out.append((f"{prompt}, {style}" if style else prompt, motion, member.id if member else None))
     return out if len(out) == len(energies) else None
 
 
@@ -163,9 +194,11 @@ def plan(
     settings: Settings | None = None,
     use_llm: bool = True,
     seed: int = 0,
+    cast: list[CastMember] | None = None,
 ) -> tuple[list[Shot], str]:
     """Returns the shots and which planner produced them ("llm" or "template")."""
     settings = settings or Settings()
+    cast = cast or []
     cuts = cut_points(a, w)
     spans = list(zip(cuts[:-1], cuts[1:]))
     energies = [a.energy_at(w.start + (s + e) / 2) for s, e in spans]
@@ -173,14 +206,14 @@ def plan(
     prompts = None
     source = "template"
     if use_llm:
-        prompts = _llm_prompts(settings, user_prompt, style, a.tempo, energies)
+        prompts = _llm_prompts(settings, user_prompt, style, a.tempo, energies, cast)
         if prompts:
             source = "llm"
     if not prompts:
-        prompts = _template_prompts(user_prompt, style, len(spans), seed)
+        prompts = _template_prompts(user_prompt, style, len(spans), seed, cast)
 
     shots = [
-        Shot(index=i, start=s, end=e, prompt=p, motion=m, intensity=round(en, 3))
-        for i, ((s, e), (p, m), en) in enumerate(zip(spans, prompts, energies))
+        Shot(index=i, start=s, end=e, prompt=p, motion=m, intensity=round(en, 3), character=c)
+        for i, ((s, e), (p, m, c), en) in enumerate(zip(spans, prompts, energies))
     ]
     return shots, source

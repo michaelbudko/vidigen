@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Analysis, api, bridge, fmtTime, Job, mediaUrl, SongLicense, SystemInfo } from "./api";
+import {
+  Analysis, api, bridge, Character, EngineStatus, fmtTime, Job, mediaUrl, resetConnection, SongLicense, SystemInfo,
+} from "./api";
+import { avatarOf, Characters } from "./components/Characters";
 import { EnergyTimeline } from "./components/EnergyTimeline";
 import { JobView } from "./components/JobView";
+import { Welcome } from "./components/Welcome";
 
 const LICENSES: { value: SongLicense; label: string; credit: boolean }[] = [
   { value: "own_work", label: "My own music", credit: false },
   { value: "cc0", label: "CC0 (no rights reserved)", credit: false },
   { value: "public_domain", label: "Public domain", credit: false },
-  { value: "cc_by", label: "CC BY (credit required)", credit: true },
-  { value: "cc_by_sa", label: "CC BY-SA (credit required)", credit: true },
+  { value: "cc_by", label: "CC BY (credit the artist)", credit: true },
+  { value: "cc_by_sa", label: "CC BY-SA (credit the artist)", credit: true },
   { value: "licensed", label: "I have a licence for it", credit: false },
 ];
 
@@ -19,21 +23,29 @@ const basename = (p: string) => p.split(/[\\/]/).pop() ?? p;
 export default function App() {
   const [sys, setSys] = useState<SystemInfo | null>(null);
   const [engineErr, setEngineErr] = useState("");
+  const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const [view, setView] = useState<"create" | "characters">("create");
+  const [showSetup, setShowSetup] = useState(false);
 
-  const [song, setSong] = useState("");
+  const [characters, setCharacters] = useState<Character[]>([]);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [cast, setCast] = useState<string[]>([]);
+
+  const [prompt, setPrompt] = useState("");
+  const [style, setStyle] = useState("Cinematic");
+
+  const [song, setSong] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [start, setStart] = useState(0);
   const [duration, setDuration] = useState(45);
+  const [bpm, setBpm] = useState(120);
 
   const [license, setLicense] = useState<SongLicense>("own_work");
   const [title, setTitle] = useState("");
   const [artist, setArtist] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
-  const [attested, setAttested] = useState(false);
 
-  const [prompt, setPrompt] = useState("");
-  const [style, setStyle] = useState("Cinematic");
   const [footage, setFootage] = useState<string | null>(null);
   const [preset, setPreset] = useState("mock");
   const [useLlm, setUseLlm] = useState(true);
@@ -44,17 +56,35 @@ export default function App() {
   const [formErr, setFormErr] = useState("");
   const audioRef = useRef<HTMLAudioElement>(null);
 
-  useEffect(() => {
+  const loadCharacters = useCallback(() => api.characters().then(setCharacters).catch(() => {}), []);
+
+  const connect = useCallback(() => {
+    setEngineErr("");
+    setSys(null);
+    resetConnection();
     api
       .system()
       .then((s) => {
         setSys(s);
         setPreset(s.recommended_preset);
         setUseLlm(s.llm.available);
+        api.jobs().then(setHistory).catch(() => {});
+        loadCharacters();
       })
       .catch((e) => setEngineErr(String(e.message ?? e)));
-    api.jobs().then(setHistory).catch(() => {});
-  }, []);
+  }, [loadCharacters]);
+
+  useEffect(() => {
+    const off = bridge?.onEngineStatus(setEngineStatus);
+    bridge?.engineStatus().then(setEngineStatus);
+    connect();
+    return off;
+  }, [connect]);
+
+  // Drop cast members that were deleted.
+  useEffect(() => {
+    setCast((c) => c.filter((id) => characters.some((ch) => ch.id === id)));
+  }, [characters]);
 
   const loadSong = useCallback(
     async (path: string) => {
@@ -69,12 +99,19 @@ export default function App() {
         if (r.analysis.duration < duration) setDuration(Math.max(30, Math.floor(r.analysis.duration)));
       } catch (e) {
         setFormErr((e as Error).message);
+        setSong(null);
       } finally {
         setAnalyzing(false);
       }
     },
     [duration],
   );
+
+  function clearSong() {
+    audioRef.current?.pause();
+    setSong(null);
+    setAnalysis(null);
+  }
 
   // Poll the active job.
   useEffect(() => {
@@ -87,24 +124,30 @@ export default function App() {
     return () => clearInterval(t);
   }, [job?.id, job?.status]);
 
-  const credit = LICENSES.find((l) => l.value === license)!.credit;
+  const needsCredit = LICENSES.find((l) => l.value === license)!.credit && !(title && artist);
   const busy = job?.status === "running" || job?.status === "queued";
-  const ready = song && analysis && prompt.trim().length >= 3 && attested && (!credit || (title && artist));
+  const ready = !!sys && prompt.trim().length >= 3 && !analyzing;
+  const presetInfo = sys?.presets.find((p) => p.name === preset);
+  const presetReady = !!presetInfo && (presetInfo.download_gb === 0 || (presetInfo.downloaded && !!sys?.ml_runtime));
+  const welcome = !sys || !sys.setup.complete || showSetup;
+  const maxLen = analysis ? Math.min(90, Math.floor(analysis.duration)) : 90;
 
   async function render() {
     setFormErr("");
     try {
       const j = await api.render({
         song_path: song,
+        characters: cast,
+        bpm,
         prompt,
         style: style.toLowerCase(),
         duration,
-        start,
+        start: song ? start : null,
         preset,
         use_llm: useLlm,
         seed,
         source_video: footage,
-        rights: { license, title, artist, source_url: sourceUrl, attested },
+        rights: { license, title, artist, source_url: sourceUrl },
       });
       setJob(j);
     } catch (e) {
@@ -120,6 +163,11 @@ export default function App() {
     a.play();
   }
 
+  async function pickSong() {
+    const p = bridge ? await bridge.openFile("audio") : window.prompt("Path to audio file");
+    if (p) loadSong(p);
+  }
+
   const gpu = sys?.gpus[0];
 
   return (
@@ -129,11 +177,17 @@ export default function App() {
           <span className="logo" />
           Vidigen
         </div>
+        <nav className="tabs">
+          <button className={view === "create" ? "on" : ""} onClick={() => setView("create")}>
+            Create
+          </button>
+          <button className={view === "characters" ? "on" : ""} onClick={() => setView("characters")}>
+            Characters {characters.length > 0 && <span className="count">{characters.length}</span>}
+          </button>
+        </nav>
         <div className="status">
           {engineErr ? (
-            <span className="pill bad" title={engineErr}>
-              Engine offline
-            </span>
+            <span className="pill bad">Engine offline</span>
           ) : sys ? (
             <>
               <span className={`pill ${gpu ? "good" : ""}`}>
@@ -144,110 +198,83 @@ export default function App() {
               </span>
             </>
           ) : (
-            <span className="pill">Starting engine…</span>
+            <span className="pill">{engineStatus?.message ?? "Starting engine…"}</span>
           )}
+          <button className="pill btn" onClick={() => setShowSetup(true)}>
+            Setup
+          </button>
         </div>
       </header>
 
-      <main className="layout">
+      {welcome && (
+        <Welcome
+          sys={sys}
+          engineErr={engineErr}
+          engineStatus={engineStatus}
+          onRetry={connect}
+          onClose={() => setShowSetup(false)}
+          onDone={(goTo) => {
+            setShowSetup(false);
+            connect();
+            if (goTo === "characters") {
+              setView("characters");
+              setEditing(null);
+            }
+          }}
+        />
+      )}
+
+      {view === "characters" && sys && (
+        <Characters
+          characters={characters}
+          selected={editing}
+          preset={presetReady ? preset : "mock"}
+          presetReady={presetReady}
+          onSelect={setEditing}
+          onChange={loadCharacters}
+          onOpenSetup={() => setShowSetup(true)}
+        />
+      )}
+
+      <main className="layout" hidden={view !== "create"}>
         <section className="panel form">
           <div className="card">
             <h2>
-              <b>1</b> Song
-            </h2>
-            <div
-              className={`drop ${song ? "has" : ""}`}
-              onClick={async () => {
-                const p = bridge ? await bridge.openFile("audio") : window.prompt("Path to audio file");
-                if (p) loadSong(p);
-              }}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault();
-                const f = e.dataTransfer.files[0];
-                if (f && bridge) loadSong(bridge.pathForFile(f));
-              }}
-            >
-              {song ? (
-                <>
-                  <strong>{basename(song)}</strong>
-                  <span>
-                    {analyzing
-                      ? "Finding the beat…"
-                      : analysis
-                        ? `${analysis.tempo.toFixed(0)} BPM · ${fmtTime(analysis.duration)} · ${analysis.beats.length} beats`
-                        : ""}
-                  </span>
-                </>
-              ) : (
-                <>
-                  <strong>Drop a song or click to browse</strong>
-                  <span>MP3, WAV, FLAC, OGG, M4A</span>
-                </>
-              )}
-            </div>
-            {analysis && (
-              <>
-                <EnergyTimeline analysis={analysis} start={start} duration={duration} onSeek={setStart} />
-                <div className="row">
-                  <label className="grow">
-                    Length <em>{fmtTime(duration)}</em>
-                    <input
-                      type="range"
-                      min={30}
-                      max={Math.min(90, Math.floor(analysis.duration))}
-                      step={5}
-                      value={duration}
-                      onChange={(e) => {
-                        const d = +e.target.value;
-                        setDuration(d);
-                        setStart((s) => Math.min(s, analysis.duration - d));
-                      }}
-                    />
-                  </label>
-                  {bridge && (
-                    <button className="ghost small" onClick={preview}>
-                      ▶ Preview
-                    </button>
-                  )}
-                </div>
-                {bridge && <audio ref={audioRef} src={mediaUrl(song)} />}
-              </>
-            )}
-          </div>
-
-          <div className="card">
-            <h2>
-              <b>2</b> Rights
-            </h2>
-            <select value={license} onChange={(e) => setLicense(e.target.value as SongLicense)}>
-              {LICENSES.map((l) => (
-                <option key={l.value} value={l.value}>
-                  {l.label}
-                </option>
-              ))}
-            </select>
-            <div className="row">
-              <input placeholder={`Song title${credit ? "" : " (optional)"}`} value={title} onChange={(e) => setTitle(e.target.value)} />
-              <input placeholder={`Artist${credit ? "" : " (optional)"}`} value={artist} onChange={(e) => setArtist(e.target.value)} />
-            </div>
-            {credit && <input placeholder="Source link (optional)" value={sourceUrl} onChange={(e) => setSourceUrl(e.target.value)} />}
-            <label className="check">
-              <input type="checkbox" checked={attested} onChange={(e) => setAttested(e.target.checked)} />I confirm I
-              have the right to use this song in a public video.
-            </label>
-          </div>
-
-          <div className="card">
-            <h2>
-              <b>3</b> Vision
+              <b>1</b> Vision
             </h2>
             <textarea
               rows={3}
+              autoFocus
               placeholder="A lone astronaut wandering a neon desert at night, chasing a glowing jellyfish…"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
             />
+            <div className="cast">
+              <span className="cast-label">Cast</span>
+              {characters.map((c) => {
+                const on = cast.includes(c.id);
+                return (
+                  <button
+                    key={c.id}
+                    className={`cast-chip ${on ? "on" : ""}`}
+                    onClick={() => setCast(on ? cast.filter((id) => id !== c.id) : [...cast, c.id])}
+                    title={on ? "In this video" : "Add to this video"}
+                  >
+                    <img src={avatarOf(c)} alt="" />
+                    {c.name}
+                  </button>
+                );
+              })}
+              <button
+                className="cast-chip add"
+                onClick={() => {
+                  setView("characters");
+                  setEditing(null);
+                }}
+              >
+                {characters.length ? "+ New" : "+ Add yourself as a character"}
+              </button>
+            </div>
             <div className="chips">
               {STYLES.map((s) => (
                 <button key={s} className={`chip ${style === s ? "on" : ""}`} onClick={() => setStyle(style === s ? "" : s)}>
@@ -255,6 +282,96 @@ export default function App() {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="card">
+            <h2>
+              <b>2</b> Music <span className="optional">optional</span>
+            </h2>
+            {song ? (
+              <div className="drop has">
+                <div className="drop-row">
+                  <strong>{basename(song)}</strong>
+                  <button className="ghost small" onClick={clearSong}>
+                    Remove
+                  </button>
+                </div>
+                <span>
+                  {analyzing
+                    ? "Finding the beat…"
+                    : analysis
+                      ? `${analysis.tempo.toFixed(0)} BPM · ${fmtTime(analysis.duration)} · ${analysis.beats.length} beats`
+                      : ""}
+                </span>
+              </div>
+            ) : (
+              <div
+                className="drop"
+                onClick={pickSong}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const f = e.dataTransfer.files[0];
+                  if (f && bridge) loadSong(bridge.pathForFile(f));
+                }}
+              >
+                <strong>Add a song</strong>
+                <span>Or skip it: you get a silent video cut to the tempo below, ready for a TikTok sound</span>
+              </div>
+            )}
+            {analysis && <EnergyTimeline analysis={analysis} start={start} duration={duration} onSeek={setStart} />}
+            <div className="row">
+              <label className="grow">
+                Length <em>{fmtTime(duration)}</em>
+                <input
+                  type="range"
+                  min={30}
+                  max={maxLen}
+                  step={5}
+                  value={duration}
+                  onChange={(e) => {
+                    const d = +e.target.value;
+                    setDuration(d);
+                    if (analysis) setStart((s) => Math.min(s, analysis.duration - d));
+                  }}
+                />
+              </label>
+              {song ? (
+                bridge && (
+                  <button className="ghost small" onClick={preview}>
+                    ▶ Preview
+                  </button>
+                )
+              ) : (
+                <label className="seed">
+                  BPM
+                  <input type="number" min={60} max={200} value={bpm} onChange={(e) => setBpm(+e.target.value)} />
+                </label>
+              )}
+            </div>
+            {song && bridge && <audio ref={audioRef} src={mediaUrl(song)} />}
+            {song && (
+              <div className="rights">
+                <div className="row">
+                  <select value={license} onChange={(e) => setLicense(e.target.value as SongLicense)}>
+                    {LICENSES.map((l) => (
+                      <option key={l.value} value={l.value}>
+                        {l.label}
+                      </option>
+                    ))}
+                  </select>
+                  <input placeholder="Title" value={title} onChange={(e) => setTitle(e.target.value)} />
+                  <input placeholder="Artist" value={artist} onChange={(e) => setArtist(e.target.value)} />
+                </div>
+                {needsCredit && <p className="hint warn">Add the title and artist so the caption credits them.</p>}
+              </div>
+            )}
+          </div>
+
+          <div className="card">
+            <h2>
+              <b>3</b> Footage <span className="optional">optional</span>
+            </h2>
             <div className="footage">
               {footage ? (
                 <>
@@ -266,13 +383,16 @@ export default function App() {
                   </button>
                 </>
               ) : (
-                <button
-                  className="ghost small"
-                  disabled={!bridge}
-                  onClick={async () => setFootage((await bridge?.openFile("video")) ?? null)}
-                >
-                  + Add your own footage (video-to-video)
-                </button>
+                <>
+                  <span>Restyle your own clip instead of generating scenes</span>
+                  <button
+                    className="ghost small"
+                    disabled={!bridge}
+                    onClick={async () => setFootage((await bridge?.openFile("video")) ?? null)}
+                  >
+                    + Add video
+                  </button>
+                </>
               )}
             </div>
           </div>
@@ -291,14 +411,26 @@ export default function App() {
                     onClick={() => setPreset(p.name)}
                     title={p.description}
                   >
-                    <strong>{p.name}</strong>
+                    <strong>{p.label}</strong>
                     <span>{p.min_vram_gb ? `${p.min_vram_gb}+ GB` : "any PC"}</span>
-                    {tooBig && p.min_vram_gb > 0 && <small>may not fit</small>}
+                    {p.download_gb > 0 && !p.downloaded ? (
+                      <small>not installed</small>
+                    ) : (
+                      tooBig && p.min_vram_gb > 0 && <small>may not fit</small>
+                    )}
                   </button>
                 );
               })}
             </div>
             <p className="hint">{sys?.presets.find((p) => p.name === preset)?.description}</p>
+            {sys && !presetReady && (
+              <p className="hint warn">
+                {presetInfo?.label} isn't installed yet.{" "}
+                <button className="link" onClick={() => setShowSetup(true)}>
+                  Open Setup
+                </button>
+              </p>
+            )}
             <div className="row">
               <label className="check">
                 <input type="checkbox" checked={useLlm} onChange={(e) => setUseLlm(e.target.checked)} />
@@ -327,7 +459,7 @@ export default function App() {
                   <button key={h.id} className={`history-item ${job?.id === h.id ? "on" : ""}`} onClick={() => setJob(h)}>
                     <span className={`dot ${h.status}`} />
                     <span className="h-prompt">{h.request.prompt}</span>
-                    <span className="muted">{basename(h.request.song_path)}</span>
+                    <span className="muted">{h.request.song_path ? basename(h.request.song_path) : "no song"}</span>
                   </button>
                 ))}
               </div>

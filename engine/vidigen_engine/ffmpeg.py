@@ -1,7 +1,8 @@
-"""Thin wrappers around the ffmpeg and ffprobe binaries."""
+"""Thin wrappers around the ffmpeg binary (no ffprobe needed, so the bundled
+imageio-ffmpeg build is enough)."""
 from __future__ import annotations
 
-import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -16,18 +17,17 @@ def run(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.strip().splitlines()[-15:])
-        raise FFmpegError(f"{cmd[0]} failed ({proc.returncode}):\n{tail}")
+        raise FFmpegError(f"ffmpeg failed ({proc.returncode}):\n{tail}")
 
 
-def probe_duration(ffprobe: str, path: Path) -> float:
-    proc = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise FFmpegError(f"ffprobe could not read {path}: {proc.stderr.strip()}")
-    return float(json.loads(proc.stdout)["format"]["duration"])
+def probe_duration(ffmpeg: str, path: Path) -> float:
+    # `ffmpeg -i` with no output exits non-zero but prints the container duration.
+    proc = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path)], capture_output=True, text=True)
+    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr)
+    if not m:
+        raise FFmpegError(f"could not read {path}")
+    h, mnt, s = m.groups()
+    return int(h) * 3600 + int(mnt) * 60 + float(s)
 
 
 def decode_mono(ffmpeg: str, path: Path, sr: int) -> np.ndarray:

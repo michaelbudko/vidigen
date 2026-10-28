@@ -17,7 +17,7 @@ def fit_clip(settings: Settings, src: Path, duration: float, out: Path) -> Path:
     Short generations (AI models top out around 5 s) are slowed down up to 2x,
     then the last frame is held for whatever is left.
     """
-    have = ffmpeg.probe_duration(settings.ffprobe, src)
+    have = ffmpeg.probe_duration(settings.ffmpeg, src)
     stretch = min(2.0, max(1.0, duration / have)) if have > 0 else 1.0
     vf = (
         f"setpts={stretch:.4f}*PTS,"
@@ -41,17 +41,27 @@ def concat(settings: Settings, clips: list[Path], out: Path) -> Path:
     return out
 
 
-def mux(settings: Settings, video: Path, song: Path, window: Window, out: Path, metadata: dict | None = None) -> Path:
-    fade_out = min(1.5, window.duration / 10)
-    af = (
-        f"atrim=start={window.start:.3f}:end={window.end:.3f},asetpts=PTS-STARTPTS,"
-        f"afade=t=in:d=0.15,afade=t=out:st={window.duration - fade_out:.3f}:d={fade_out:.3f}"
-    )
+def mux(
+    settings: Settings, video: Path, song: Path | None, window: Window, out: Path, metadata: dict | None = None
+) -> Path:
+    """Lay the song clip under the video. Without a song, add a silent track so
+    every player and uploader treats the file the same way."""
+    if song is not None:
+        fade_out = min(1.5, window.duration / 10)
+        audio_in = ["-i", str(song)]
+        af = (
+            f"atrim=start={window.start:.3f}:end={window.end:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:d=0.15,afade=t=out:st={window.duration - fade_out:.3f}:d={fade_out:.3f}"
+        )
+    else:
+        audio_in = ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+        af = "anull"
     meta = []
     for k, v in (metadata or {}).items():
-        meta += ["-metadata", f"{k}={v}"]
+        if v:
+            meta += ["-metadata", f"{k}={v}"]
     ffmpeg.run([
-        settings.ffmpeg, "-y", "-v", "error", "-i", str(video), "-i", str(song),
+        settings.ffmpeg, "-y", "-v", "error", "-i", str(video), *audio_in,
         "-map", "0:v:0", "-map", "1:a:0", "-af", af, "-c:v", "copy",
         "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-shortest",
         "-movflags", "+faststart", *meta, str(out),

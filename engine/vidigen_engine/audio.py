@@ -156,6 +156,22 @@ def analyze(path: Path, settings: Settings | None = None) -> Analysis:
     )
 
 
+def beat_grid(duration: float, bpm: float) -> Analysis:
+    """A synthetic analysis for renders without a song: steady beats at `bpm`,
+    a calmer first quarter, then full energy, so pacing still builds."""
+    bpm = float(np.clip(bpm, 60, 200))
+    beats = np.arange(0, duration + 1e-6, 60.0 / bpm)
+    secs = int(np.ceil(duration)) + 1
+    energy = [0.45 if i < duration / 4 else 0.8 for i in range(secs)]
+    return Analysis(
+        duration=round(duration, 3),
+        tempo=bpm,
+        beats=[round(float(b), 3) for b in beats],
+        downbeats=[round(float(b), 3) for b in beats[::4]],
+        energy=energy,
+    )
+
+
 def choose_window(a: Analysis, target: float, start: float | None = None) -> Window:
     """Pick the clip of the song to use.
 
